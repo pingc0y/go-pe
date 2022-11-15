@@ -26,6 +26,7 @@ type _IMAGE_BASE_RELOCATION struct {
 	SizeOfBlock    uint32 //当前BASE大小
 }
 
+//DOS头
 type IMAGE_DOS_HEADER struct {
 	E_magic    uint16     //[长度:02h] [Magic number.][DOS可执行文件标记"MZ"头,定义为"5A4Dh",定值.]
 	E_cblp     uint16     //[长度:02h] [Bytes on last page of file.]
@@ -51,7 +52,6 @@ type IMAGE_NT_HEADERS32 struct {
 	Signature      uint32                  //[长度:04h] [PE文件标志("PE",0,0),长度为"4".]
 	FileHeader     IMAGE_FILE_HEADER       //[长度:14h] [IMAGE_FILE_HEADER结构,长度为"20".]
 	OptionalHeader IMAGE_OPTIONAL_HEADER32 //[长度:e0h] [IMAGE_OPTIONAL_HEADER32结构,默认长度为"e0h"(224).]
-
 }
 
 type IMAGE_FILE_HEADER struct {
@@ -116,6 +116,36 @@ type IMAGE_SECTION_HEADER struct {
 	Characteristics      uint32 //[长度:04h] [标志(块属性):20000000h 40000000h 00000020h ]
 }
 
+//导出表
+type IMAGE_IMPORT_DESCRIPTOR struct {
+	OriginalFirstThunk uint32 //RVA 指向IMAGE_THUNK_DATA结构数组
+	TimeDateStamp      uint32 //时间戳
+	ForwarderChain     uint32
+	Name               uint32 //RVA,指向dll名字，该名字已0结尾
+	FirstThunk         uint32 //RVA,指向IMAGE_THUNK_DATA结构数组
+}
+
+type IMAGE_IMPORT_BY_NAME struct {
+	Hint uint16 //导出表中的索引
+	Name byte   //函数名，长度不定，以‘\0’结尾来判断
+}
+
+type IMAGE_BOUND_IMPORT_DESCRIPTOR struct {
+	TimeDateStamp               uint32 //时间，用来判断是不是同一个dll
+	OffsetModuleName            uint16 //dll的名称
+	NumberOfModuleForwarderRefs uint16 //引用的其他dll数量，后面REFd的数量
+}
+
+type IMAGE_BOUND_FORWARDER_REF struct {
+	TimeDateStamp    uint32 //时间，用来判断是不是同一个dll
+	OffsetModuleName uint16 //dll的名称，要加上第一个IMAGE_BOUND_IMPORT_DESCRIPTOR的地址
+	Reserved         uint16 //保留，没有做用
+}
+
+type IMAGE_THUNK_DATA32 struct {
+	Data uint32 //通过最高位是1，那么去掉最高位就是函数导出序号。如果不是1，那么就是一个RVA指向IMAGE_IMPORT_BY_NAME
+}
+
 type PortableExecutable struct {
 	DOS     IMAGE_DOS_HEADER
 	Rubbish []byte
@@ -136,6 +166,21 @@ func (pe *PortableExecutable) ReadAt(bs []byte, off int64) {
 		bs[i] = SByte[off+int64(i)]
 	}
 }
+
+func (pe *PortableExecutable) ReadAtString(off int64) []byte {
+	SByte, err := pe.GetByte()
+	if err != nil {
+		panic(err)
+	}
+	var bs []byte
+	for i := 0; ; i++ {
+		if SByte[off+int64(i)] == 0 {
+			break
+		}
+		bs = append(bs, SByte[off+int64(i)])
+	}
+	return bs
+}
 func (pe *PortableExecutable) WriteAt(bs []byte, off int64) {
 	SByte, err := pe.GetByte()
 	if err != nil {
@@ -147,11 +192,6 @@ func (pe *PortableExecutable) WriteAt(bs []byte, off int64) {
 		}
 		SByte[off+int64(i)] = v
 	}
-}
-func (pe *PortableExecutable) update(f *os.File) {
-	pe.readDOS(f)
-	pe.readNT(f)
-	pe.readSection(f)
 }
 
 //解析PE并返回pe对象
@@ -214,6 +254,13 @@ func (pe *PortableExecutable) readNT(f *os.File) IMAGE_NT_HEADERS32 {
 	return nt
 }
 
+func (pe *PortableExecutable) is32() bool {
+	if PE.NT.OptionalHeader.Magic == 267 {
+		return true
+	}
+	return false
+}
+
 //读取节表
 func (pe *PortableExecutable) readSection(f *os.File) []IMAGE_SECTION_HEADER {
 
@@ -221,7 +268,9 @@ func (pe *PortableExecutable) readSection(f *os.File) []IMAGE_SECTION_HEADER {
 	//获取节表数量
 	sectionNum := int(pe.NT.FileHeader.NumberOfSections)
 	sectionsHeader := make([]byte, 40)
-	sk := int(pe.DOS.E_lfanew) + binary.Size(pe.NT)
+	ntsize := binary.Size(pe.NT)
+
+	sk := int(pe.DOS.E_lfanew) + ntsize
 
 	for i := 0; i < sectionNum; i++ {
 
@@ -241,7 +290,7 @@ func (pe *PortableExecutable) readSection(f *os.File) []IMAGE_SECTION_HEADER {
 
 //内存偏移转文件偏移
 func (pe *PortableExecutable) RVAtoFOA(RVA uint32) int64 {
-	if uint64(RVA) < uint64(binary.Size(pe.SECTION[0].VirtualAddress)) {
+	if uint64(RVA) < uint64(pe.SECTION[0].VirtualAddress) {
 		return int64(RVA)
 	}
 	//通过循环判断是在哪个节区
@@ -275,7 +324,7 @@ func (pe *PortableExecutable) FOAtoRVA(FOA uint32) int64 {
 func ByteToStruct(be []byte, obj any) {
 	//转为io.Reader类型
 	reader := bytes.NewReader(be)
-	//[]byte转section结构体
+	//[]byte转结构体
 	err := binary.Read(reader, binary.LittleEndian, obj)
 	if err != nil {
 		panic(err)
@@ -336,7 +385,7 @@ func (pe *PortableExecutable) readExportTable() {
 		return
 	}
 	foa := pe.RVAtoFOA(rva)
-	mk := make([]byte, 64)
+	mk := make([]byte, 40)
 	pe.ReadAt(mk, foa)
 	var ex IMAGE_EXPORT_DIRECTORY
 	ByteToStruct(mk, &ex)
@@ -369,8 +418,97 @@ func (pe *PortableExecutable) readExportTable() {
 
 }
 
+//读取导入表
+func (pe *PortableExecutable) readImportTable() []IMAGE_IMPORT_DESCRIPTOR {
+	rva := pe.NT.OptionalHeader.DataDirectory[1].VirtualAddress
+	foa := pe.RVAtoFOA(rva)
+	var list []IMAGE_IMPORT_DESCRIPTOR
+	for {
+		mk := make([]byte, 20)
+		pe.ReadAt(mk, foa)
+		var is int
+		for _, v := range mk {
+			is += int(v)
+		}
+		if is == 0 {
+			break
+		}
+		var imp IMAGE_IMPORT_DESCRIPTOR
+		ByteToStruct(mk, &imp)
+		list = append(list, imp)
+		foa += 20
+	}
+
+	return list
+
+}
+
+//读取THUNK表
+func (pe *PortableExecutable) readThunk(foa int64) []IMAGE_THUNK_DATA32 {
+	if foa == 0 {
+		return nil
+	}
+	var list []IMAGE_THUNK_DATA32
+	for {
+		mk := make([]byte, 4)
+		pe.ReadAt(mk, foa)
+		var is int
+		for _, v := range mk {
+			is += int(v)
+		}
+		if is == 0 {
+			break
+		}
+		var thunk IMAGE_THUNK_DATA32
+		ByteToStruct(mk, &thunk)
+		//if thunk.Data >= 2147483648{
+		//	fmt.Printf("函数序号：%x\n",thunk.Data - 2147483648)
+		//}else {
+		//	nameFOA := pe.RVAtoFOA(thunk.Data)
+		//	name := PE.ReadAtString(nameFOA+2)
+		//	fmt.Printf("函数名：%s\n",name)
+		//}
+		foa += 4
+		list = append(list, thunk)
+	}
+	return list
+}
+
+//读绑定导入表
+func (pe *PortableExecutable) readBindImportTable() [][]any {
+	foa := pe.RVAtoFOA(pe.NT.OptionalHeader.DataDirectory[11].VirtualAddress)
+	if foa == 0 {
+		return nil
+	}
+	var list [][]any
+	for o := 0; ; o++ {
+		mk := make([]byte, 8)
+		pe.ReadAt(mk, foa)
+		var is int
+		for _, v := range mk {
+			is += int(v)
+		}
+		if is == 0 {
+			break
+		}
+		var imp IMAGE_BOUND_IMPORT_DESCRIPTOR
+		ByteToStruct(mk, &imp)
+		foa += 8
+		list = append(list, []any{imp})
+		for i := 0; i < int(imp.NumberOfModuleForwarderRefs); i++ {
+			mk := make([]byte, 8)
+			pe.ReadAt(mk, foa)
+			var ref IMAGE_BOUND_FORWARDER_REF
+			ByteToStruct(mk, &ref)
+			foa += 8
+			list[o] = append(list[o], ref)
+		}
+	}
+	return list
+}
+
 //读取重定向表
-func (pe PortableExecutable) readRelocation() {
+func (pe *PortableExecutable) readRelocation() {
 	rva := pe.NT.OptionalHeader.DataDirectory[5].VirtualAddress
 	foa := pe.RVAtoFOA(rva)
 	if rva == 0 {
